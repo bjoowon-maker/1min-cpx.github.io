@@ -1343,119 +1343,320 @@ function updateTimerUI() {
     else badge.classList.remove('urgent');
 }
 
-/* --- OCR LOGIC (Integrated & Safe) --- */
+/* --- OCR LOGIC (Replaced: Hankkeut Table + Safe Fallback) --- */
+
+// 적용 모드: "fill"(기본, 빈칸만) | "append"(덧붙이기) | "replace"(덮어쓰기)
+const OCR_APPLY_MODE = "fill";
+
+// 한끝 표에서 사용할 섹션(1열) = A/C/F
+const HANKEUT_SECTIONS = ["A", "C", "F"];
+
+// 기존 방식(일반 문서)에서 사용할 섹션
+const GENERIC_FIELDS = (typeof ALL_FIELDS !== "undefined" && Array.isArray(ALL_FIELDS))
+  ? ALL_FIELDS
+  : ["C","A","F","PEx","Edu","Memo"];
+
 function triggerOCR() {
-    if(location.protocol === 'file:') {
-        alert("OCR 기능은 보안상의 이유로\n'file://'(파일 열기)에서는 작동하지 않습니다.\n\n웹 서버(http://localhost)나\nGithub Pages에 올려서 테스트해주세요.");
-        return;
+  if (location.protocol === "file:") {
+    alert(
+      "OCR 기능은 보안상의 이유로\n'file://'(파일 열기)에서는 작동하지 않습니다.\n\n" +
+      "웹 서버(http://localhost) 또는 Github Pages에 올려서 테스트해주세요."
+    );
+    return;
+  }
+  const input = document.getElementById("ocr-input");
+  if (!input) {
+    alert("OCR 입력 요소(#ocr-input)를 찾지 못했습니다.");
+    return;
+  }
+  input.click();
+}
+
+function normalizeOcrLine(line) {
+  return (line || "")
+    .replace(/\r/g, "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// OCR이 "A ." "A|" 같은 형태로 내는 경우를 대비해 단독 섹션 라인 감지
+function detectHankkeutSectionLetter(line) {
+  const s = normalizeOcrLine(line).replace(/[|.·•\-:()\[\]]/g, "").trim();
+  if (HANKEUT_SECTIONS.includes(s)) return s;
+  return null;
+}
+
+// "암기법" 라인 감지(오인식 대비 느슨하게)
+function isMnemonicLine(line) {
+  return /암\s*기\s*법/i.test(line);
+}
+
+// 한끝 표 파서: A/C/F 섹션별로 [용어] 수집 + 암기법 수집
+function parseHankkeutTableText(rawText) {
+  const text = (rawText || "").replace(/\r/g, "\n");
+  const lines = text.split("\n").map(normalizeOcrLine).filter(Boolean);
+
+  const buckets = {};
+  HANKEUT_SECTIONS.forEach(k => buckets[k] = { terms: [], mnemonicLines: [] });
+
+  let current = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    const sec = detectHankkeutSectionLetter(line);
+    if (sec) {
+      current = sec;
+      continue;
     }
-    document.getElementById('ocr-input').click();
+    if (!current) continue;
+
+    // 대괄호 용어 수집
+    const bracketMatches = line.match(/\[[^\]]+\]/g);
+    if (bracketMatches) {
+      bracketMatches.forEach(m => {
+        const t = m.trim();
+        if (t && !buckets[current].terms.includes(t)) buckets[current].terms.push(t);
+      });
+    }
+
+    // 암기법 수집
+    if (isMnemonicLine(line)) {
+      // 같은 줄에 암기법 내용이 붙어 있으면 포함
+      const after = line.replace(/.*암\s*기\s*법\s*[:\-]?\s*/i, "").trim();
+      if (after) buckets[current].mnemonicLines.push(after);
+
+      // 다음 섹션(A/C/F) 나오기 전까지 후속 라인 흡수
+      let j = i + 1;
+      while (j < lines.length) {
+        const nextLine = lines[j];
+        const nextSec = detectHankkeutSectionLetter(nextLine);
+        if (nextSec) break;
+        if (nextLine.length >= 2) buckets[current].mnemonicLines.push(nextLine);
+        j++;
+      }
+      i = j - 1;
+    }
+  }
+
+  // 결과 조립
+  const result = {};
+  HANKEUT_SECTIONS.forEach(sec => {
+    const termsLine = buckets[sec].terms.join(", ").trim();
+    const mnemonicText = buckets[sec].mnemonicLines.join(" ").replace(/\s+/g, " ").trim();
+    const mnemonicLine = mnemonicText ? `암기법: ${mnemonicText}` : "";
+
+    if (termsLine || mnemonicLine) {
+      result[sec] = { termsLine, mnemonicLine };
+    }
+  });
+
+  return result;
+}
+
+// 일반 텍스트 파서(기존 방식 호환): C/A/F/PEx/Edu/Memo
+function parseGenericMarkedText(rawText) {
+  const text = (rawText || "").replace(/\r/g, "\n");
+  const lines = text.split("\n").map(normalizeOcrLine).filter(Boolean);
+
+  const markers = [
+    { k: "C",   r: /^(C|씨|CC|C\/C|Chief\s*complaint)\s*[:\)\]\-\.]/i },
+    { k: "A",   r: /^A\s*[:\)\]\-\.]/i },
+    { k: "F",   r: /^F\s*[:\)\]\-\.]/i },
+    { k: "PEx", r: /^(PEx|P\/?Ex|PEX|PE)\s*[:\)\]\-\.]/i },
+    { k: "Edu", r: /^(Edu|Education|교육)\s*[:\)\]\-\.]/i },
+    { k: "Memo",r: /^(Memo|메모|암기|Tip|TIPS?)\s*[:\)\]\-\.]/i }
+  ];
+
+  let current = null;
+  const parsed = {};
+  GENERIC_FIELDS.forEach(f => parsed[f] = []);
+
+  for (const line of lines) {
+    const m = markers.find(x => x.r.test(line));
+    if (m) {
+      current = m.k;
+      const content = line.replace(m.r, "").trim();
+      if (content) parsed[current].push(content);
+    } else {
+      if (current) parsed[current].push(line);
+      else parsed["Memo"].push(line);
+    }
+  }
+
+  // {field: {kLine, vLine}} 형태로 변환
+  const result = {};
+  GENERIC_FIELDS.forEach(field => {
+    const arr = parsed[field] || [];
+    if (!arr.length) return;
+    const kLine = arr[0] || "";
+    const vLine = arr.slice(1).join("\n").trim();
+    result[field] = {
+      termsLine: kLine.trim(),
+      mnemonicLine: vLine ? vLine : ""
+    };
+  });
+
+  return result;
+}
+
+function getPlainStoredHtml(html) {
+  // 기존 저장이 <div>...</div> 등 HTML일 수 있어 안전하게 텍스트만 비교
+  return (html || "").replace(/<[^>]*>/g, "").replace(/\u00A0/g, " ").trim();
+}
+
+// mode에 따라 userData에 반영
+function applyParsedToUserData(parsed, targetId, mode) {
+  if (!parsed || !targetId) return false;
+  if (!userData[targetId]) userData[targetId] = {};
+
+  let changed = false;
+  const m = mode || "fill";
+
+  Object.keys(parsed).forEach(field => {
+    const kKey = `${field}_k`;
+    const vKey = `${field}_v`;
+
+    const newK = (parsed[field].termsLine || "").trim();
+    const newV = (parsed[field].mnemonicLine || "").trim();
+
+    const oldK = getPlainStoredHtml(userData[targetId][kKey]);
+    const oldV = getPlainStoredHtml(userData[targetId][vKey]);
+
+    if (m === "replace") {
+      if (newK) { userData[targetId][kKey] = `<div>${escapeHtml(newK)}</div>`; changed = true; }
+      if (newV) { userData[targetId][vKey] = `<div style="white-space:pre-wrap;">${escapeHtml(newV)}</div>`; changed = true; }
+      return;
+    }
+
+    if (m === "append") {
+      if (newK) {
+        const mergedK = oldK ? `${oldK}\n${newK}` : newK;
+        userData[targetId][kKey] = `<div style="white-space:pre-wrap;">${escapeHtml(mergedK)}</div>`;
+        changed = true;
+      }
+      if (newV) {
+        const mergedV = oldV ? `${oldV}\n\n${newV}` : newV;
+        userData[targetId][vKey] = `<div style="white-space:pre-wrap;">${escapeHtml(mergedV)}</div>`;
+        changed = true;
+      }
+      return;
+    }
+
+    // default: fill
+    if (newK && !oldK) {
+      userData[targetId][kKey] = `<div>${escapeHtml(newK)}</div>`;
+      changed = true;
+    }
+    if (newV && !oldV) {
+      userData[targetId][vKey] = `<div style="white-space:pre-wrap;">${escapeHtml(newV)}</div>`;
+      changed = true;
+    }
+  });
+
+  return changed;
 }
 
 async function processOCR(input) {
-    const file = input.files[0];
-    input.value = '';
-    if(!file) return;
+  const file = input?.files?.[0];
+  if (input) input.value = "";
+  if (!file) return;
 
-    const btn = document.getElementById('ocr-btn');
-    const originalContent = btn.innerHTML; // SVG preservation
-    
-    try {
-        btn.innerHTML = "<span style='font-size:0.8rem;'>⏳</span>";
-        
-        // Load Image to Canvas for Resizing
-        const dataUrl = await new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                const img = new Image();
-                img.onload = () => {
-                    const canvas = document.createElement('canvas');
-                    const MAX_WIDTH = 1800;
-                    const scale = Math.min(1, MAX_WIDTH / img.width);
-                    canvas.width = img.width * scale;
-                    canvas.height = img.height * scale;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                    resolve(canvas.toDataURL('image/jpeg', 0.9));
-                };
-                img.onerror = reject;
-                img.src = e.target.result;
-            };
-            reader.readAsDataURL(file);
-        });
+  // 편집 대상이 없으면 중단(버그 방지)
+  if (!editTargetId) {
+    alert("OCR을 적용할 카드가 선택되지 않았습니다.\n목록에서 ✏️ 편집을 열고 OCR 버튼을 눌러주세요.");
+    return;
+  }
 
-        // Run Tesseract
-        const { data: { text } } = await Tesseract.recognize(dataUrl, 'eng+kor', {
-            logger: m => { if(m.status==='recognizing text') btn.innerHTML = `<span style='font-size:0.7rem;'>${Math.round(m.progress*100)}%</span>`; }
-        });
+  const btn = document.getElementById("ocr-btn");
+  const originalContent = btn ? btn.innerHTML : null;
 
-        // Parse Text
-        if(!text.trim()) throw new Error("No text found");
-        
-        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-        const markers = [
-            { k:'C', r:/^(C|씨)\s*[:\)\]\-\.]/i },
-            { k:'A', r:/^A\s*[:\)\]\-\.]/i },
-            { k:'F', r:/^F\s*[:\)\]\-\.]/i },
-            { k:'PEx', r:/^(PEx|P\/?Ex|PEX|PE)\s*[:\)\]\-\.]/i },
-            { k:'Edu', r:/^(Edu|Education|교육)\s*[:\)\]\-\.]/i },
-            { k:'Memo', r:/^(Memo|메모|암기|Tip|TIPS?)\s*[:\)\]\-\.]/i }
-        ];
+  try {
+    if (btn) btn.innerHTML = "<span style='font-size:0.8rem;'>⏳</span>";
 
-        let currentSection = null;
-        let parsed = { C:[], A:[], F:[], PEx:[], Edu:[], Memo:[] };
-        
-        lines.forEach(line => {
-            const match = markers.find(m => m.r.test(line));
-            if(match) {
-                currentSection = match.k;
-                const content = line.replace(match.r, '').trim();
-                if(content) parsed[currentSection].push(content);
-            } else {
-                if(currentSection) parsed[currentSection].push(line);
-                else parsed.Memo.push(line); // Default to Memo
-            }
-        });
+    // 이미지 리사이즈 후 dataURL
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement("canvas");
+          const MAX_WIDTH = 1800;
+          const scale = Math.min(1, MAX_WIDTH / img.width);
+          canvas.width = Math.round(img.width * scale);
+          canvas.height = Math.round(img.height * scale);
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL("image/jpeg", 0.9));
+        };
+        img.onerror = reject;
+        img.src = e.target.result;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
 
-        // Apply to UserData
-        if(!userData[editTargetId]) userData[editTargetId] = {};
-        let changed = false;
-        ALL_FIELDS.forEach(field => {
-            if(parsed[field] && parsed[field].length > 0) {
-                const k = parsed[field][0];
-                const v = parsed[field].slice(1).join('\n');
-                userData[editTargetId][field+'_k'] = `<div>${escapeHtml(k)}</div>`;
-                userData[editTargetId][field+'_v'] = `<div style="white-space:pre-wrap;">${escapeHtml(v)}</div>`;
-                changed = true;
-            }
-        });
-        
-        if(!changed && text.length > 0) {
-             // If parse failed but text exists, dump all to Memo
-             userData[editTargetId]['Memo_k'] = `<div>OCR Raw</div>`;
-             userData[editTargetId]['Memo_v'] = `<div style="white-space:pre-wrap;">${escapeHtml(text)}</div>`;
+    // Tesseract 실행
+    const { data: { text } } = await Tesseract.recognize(dataUrl, "eng+kor", {
+      logger: (m) => {
+        if (!btn) return;
+        if (m.status === "recognizing text") {
+          btn.innerHTML = `<span style='font-size:0.7rem;'>${Math.round(m.progress * 100)}%</span>`;
         }
+      }
+    });
 
-        saveUserData();
-        renderBack(cards.find(c => c.id === editTargetId), 'manager-preview-form');
-        showToast("OCR 입력 완료!");
+    if (!text || !text.trim()) throw new Error("No text found");
 
-    } catch(e) {
-        console.error(e);
-        alert("텍스트 인식 실패. 사진을 더 선명하게 찍어주세요.");
-    } finally {
-        btn.innerHTML = originalContent;
+    // 1) 한끝 표 파싱 먼저 시도 (A/C/F)
+    const hankkeutParsed = parseHankkeutTableText(text);
+    let changed = applyParsedToUserData(hankkeutParsed, editTargetId, OCR_APPLY_MODE);
+
+    // 2) 한끝으로 적용된 게 없으면 일반 파서 fallback
+    if (!changed) {
+      const genericParsed = parseGenericMarkedText(text);
+      changed = applyParsedToUserData(genericParsed, editTargetId, OCR_APPLY_MODE);
+
+      // 그래도 적용이 안 되면 raw를 Memo에 보관(빈칸일 때만)
+      if (!changed) {
+        const memoK = getPlainStoredHtml(userData[editTargetId]?.["Memo_k"]);
+        const memoV = getPlainStoredHtml(userData[editTargetId]?.["Memo_v"]);
+        if (!memoK && !memoV) {
+          userData[editTargetId]["Memo_k"] = `<div>OCR Raw</div>`;
+          userData[editTargetId]["Memo_v"] = `<div style="white-space:pre-wrap;">${escapeHtml(text.trim())}</div>`;
+          changed = true;
+        }
+      }
     }
+
+    saveUserData();
+    renderBack(cards.find(c => c.id === editTargetId), "manager-preview-form");
+    showToast(changed ? "OCR 입력 완료!" : "OCR 인식은 되었지만 적용할 내용이 없었습니다.");
+
+  } catch (e) {
+    console.error(e);
+    alert("텍스트 인식 실패. 사진을 더 선명하게 찍어주세요.");
+  } finally {
+    if (btn && originalContent !== null) btn.innerHTML = originalContent;
+  }
 }
 
 function escapeHtml(text) {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+  return (text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
+    
 
 init();
 </script>
 </body>
 </html>
+
 
 
 
